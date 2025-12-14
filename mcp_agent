@@ -1,0 +1,842 @@
+"""SQL代理系统 - 集成MCP协议"""
+
+import pathlib
+import re
+import os
+import asyncio
+from typing import List, Optional, Dict, Any
+import json
+
+import requests
+# 导入MCP相关库
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.tools import load_mcp_tools
+from langchain_mcp_adapters.interceptors import MCPToolCallRequest
+from langchain_mcp_adapters.callbacks import Callbacks, CallbackContext
+from langchain.agents import create_agent
+from langchain_community.chat_models.tongyi import ChatTongyi
+from langchain_community.utilities import SQLDatabase
+from langchain_core.messages import SystemMessage, ToolMessage
+from langchain_core.tools import tool
+
+# ============= 1. 模型初始化（保持原样） =============
+model_name = os.getenv("TONGYI_MODEL", "qwen-max")
+api_key = "sk-fc3984cf3d8a4214a0ea781b417a25b7"
+temperature_value = 0.7
+timeout_value = 30
+
+if not api_key:
+    print("警告: 环境变量 TONGYI_API_KEY 未设置，模型调用可能失败。")
+
+llm = ChatTongyi(
+    model=model_name,
+    dashscope_api_key=api_key,
+    api_key=api_key,
+    temperature=temperature_value,
+    timeout=timeout_value,
+)
+
+print("=" * 60)
+print("SQL代理系统启动")
+print(f"模型: 通义千问-qwen-max")
+print(f"温度: {temperature_value}")
+print(f"超时: {timeout_value}秒")
+print("=" * 60)
+
+# ============= 2. 下载并连接数据库（保持原样） =============
+url = "https://storage.googleapis.com/benchmarks-artifacts/chinook/Chinook.db"
+local_path = pathlib.Path("Chinook.db")
+
+if local_path.exists():
+    print(f"{local_path} 已存在，跳过下载。")
+else:
+    response = requests.get(url)
+    if response.status_code == 200:
+        local_path.write_bytes(response.content)
+        print(f"文件已下载并保存为 {local_path}")
+    else:
+        print(f"下载文件失败。状态码: {response.status_code}")
+
+db = SQLDatabase.from_uri("sqlite:///Chinook.db")
+SCHEMA = db.get_table_info()
+
+print(f"\n数据库信息:")
+print(f"方言: {db.dialect}")
+print(f"可用表: {db.get_usable_table_names()}")
+print(f"表数量: {len(db.get_usable_table_names())}")
+
+# ============= 3. 安全SQL检查函数（保持原样） =============
+DENY_RE = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|ALTER|DROP|CREATE|REPLACE|TRUNCATE)\b", re.I
+)
+HAS_LIMIT_TAIL_RE = re.compile(r"(?is)\blimit\b\s+\d+(\s*,\s*\d+)?\s*;?\s*$")
+
+
+def _safe_sql(q: str) -> str:
+    q = q.strip()
+    if q.count(";") > 1 or (q.endswith(";") and ";" in q[:-1]):
+        return "错误：不允许执行多个SQL语句。"
+    q = q.rstrip(";").strip()
+    if not q.lower().startswith("select"):
+        return "错误：只允许执行SELECT查询语句。"
+    if DENY_RE.search(q):
+        return "错误：检测到数据修改或结构变更语句。只允许只读查询。"
+    if not HAS_LIMIT_TAIL_RE.search(q):
+        q += " LIMIT 5"
+    return q
+
+
+# ============= 4. 创建MCP服务器定义 =============
+# 这里我们创建两个MCP服务器配置：一个用于SQL操作，一个用于其他工具
+MCP_SERVERS = {
+    "sql_server": {
+        "transport": "stdio",
+        "command": "python",
+        "args": ["sql_mcp_server.py"],
+    },
+    "math_server": {
+        "transport": "stdio",
+        "command": "python",
+        "args": ["math_mcp_server.py"],
+    }
+}
+
+
+# ============= 5. 创建SQL MCP服务器文件 =============
+def create_sql_mcp_server():
+    """创建SQL MCP服务器文件"""
+    server_content = '''"""SQL MCP服务器 - 提供SQL查询功能"""
+
+from fastmcp import FastMCP
+import sqlite3
+import re
+
+# 创建MCP服务器实例
+mcp = FastMCP("SQL Server")
+
+# 连接到SQLite数据库
+conn = sqlite3.connect("Chinook.db")
+
+# 安全SQL检查函数
+DENY_RE = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|ALTER|DROP|CREATE|REPLACE|TRUNCATE)\b", re.I
+)
+
+def _safe_sql(q: str) -> str:
+    """安全检查SQL查询"""
+    q = q.strip()
+    if q.count(";") > 1 or (q.endswith(";") and ";" in q[:-1]):
+        return "错误：不允许执行多个SQL语句。"
+    q = q.rstrip(";").strip()
+    if not q.lower().startswith("select"):
+        return "错误：只允许执行SELECT查询语句。"
+    if DENY_RE.search(q):
+        return "错误：检测到数据修改或结构变更语句。只允许只读查询。"
+    if not re.search(r"(?is)\\blimit\\b\\s+\\d+(\\s*,\\s*\\d+)?\\s*$", q):
+        q += " LIMIT 5"
+    return q
+
+@mcp.tool()
+def execute_sql(query: str) -> str:
+    """执行SQL查询并返回结果
+
+    Args:
+        query: SQL查询语句（必须是SELECT语句）
+
+    Returns:
+        查询结果字符串
+    """
+    safe_query = _safe_sql(query)
+
+    if safe_query.startswith("错误："):
+        return safe_query
+
+    try:
+        cursor = conn.cursor()
+        cursor.execute(safe_query)
+        results = cursor.fetchall()
+        columns = [description[0] for description in cursor.description]
+
+        # 格式化输出
+        output = []
+        output.append(" | ".join(columns))
+        output.append("-" * (sum(len(str(col)) for col in columns) + 3 * len(columns)))
+
+        for row in results:
+            output.append(" | ".join(str(cell) for cell in row))
+
+        return f"查询成功:\\n{chr(10).join(output[:15])}"  # 限制输出行数
+
+    except Exception as e:
+        return f"SQL执行错误: {e}"
+
+@mcp.tool()
+def get_table_info() -> dict:
+    """获取数据库表结构信息
+
+    Returns:
+        包含表信息的字典
+    """
+    try:
+        cursor = conn.cursor()
+
+        # 获取所有表名
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = [row[0] for row in cursor.fetchall()]
+
+        table_info = {}
+        for table in tables:
+            cursor.execute(f"PRAGMA table_info({table})")
+            columns = cursor.fetchall()
+            table_info[table] = [
+                {"name": col[1], "type": col[2], "nullable": not col[3]}
+                for col in columns
+            ]
+
+        return {
+            "tables": tables,
+            "table_details": table_info,
+            "total_tables": len(tables)
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
+@mcp.tool()
+def get_table_schema(table_name: str) -> str:
+    """获取指定表的详细结构
+
+    Args:
+        table_name: 表名
+
+    Returns:
+        表结构描述
+    """
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        columns = cursor.fetchall()
+
+        if not columns:
+            return f"表 '{table_name}' 不存在或没有列"
+
+        output = [f"表: {table_name}", "列结构:"]
+        for col in columns:
+            col_id, name, dtype, not_null, default_val, pk = col
+            nullable = "NOT NULL" if not_null else "NULL"
+            primary = "PRIMARY KEY" if pk else ""
+            default_str = f"DEFAULT {default_val}" if default_val else ""
+            output.append(f"  {name}: {dtype} {nullable} {primary} {default_str}".strip())
+
+        return chr(10).join(output)
+
+    except Exception as e:
+        return f"获取表结构错误: {e}"
+
+@mcp.tool()
+def count_records(table_name: str) -> dict:
+    """统计表中记录数量
+
+    Args:
+        table_name: 表名
+
+    Returns:
+        包含统计信息的字典
+    """
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+        count = cursor.fetchone()[0]
+
+        return {
+            "table": table_name,
+            "record_count": count,
+            "message": f"表 '{table_name}' 中共有 {count} 条记录"
+        }
+
+    except Exception as e:
+        return {"error": str(e), "table": table_name}
+
+if __name__ == "__main__":
+    # 启动MCP服务器
+    mcp.run(transport="stdio")
+'''
+
+    with open("sql_mcp_server.py", "w", encoding="utf-8") as f:
+        f.write(server_content)
+    print("✓ 已创建SQL MCP服务器文件: sql_mcp_server.py")
+
+
+# ============= 6. 创建数学MCP服务器文件 =============
+def create_math_mcp_server():
+    """创建数学MCP服务器文件"""
+    server_content = '''"""数学MCP服务器 - 提供数学计算功能"""
+
+from fastmcp import FastMCP
+import math
+
+mcp = FastMCP("Math Server")
+
+@mcp.tool()
+def add(a: float, b: float) -> float:
+    """两个数相加
+
+    Args:
+        a: 第一个数
+        b: 第二个数
+
+    Returns:
+        两数之和
+    """
+    return a + b
+
+@mcp.tool()
+def subtract(a: float, b: float) -> float:
+    """两个数相减
+
+    Args:
+        a: 被减数
+        b: 减数
+
+    Returns:
+        两数之差
+    """
+    return a - b
+
+@mcp.tool()
+def multiply(a: float, b: float) -> float:
+    """两个数相乘
+
+    Args:
+        a: 第一个数
+        b: 第二个数
+
+    Returns:
+        两数之积
+    """
+    return a * b
+
+@mcp.tool()
+def divide(a: float, b: float) -> float:
+    """两个数相除
+
+    Args:
+        a: 被除数
+        b: 除数
+
+    Returns:
+        两数之商
+
+    Raises:
+        ValueError: 除数为零时
+    """
+    if b == 0:
+        raise ValueError("除数不能为零")
+    return a / b
+
+@mcp.tool()
+def power(base: float, exponent: float) -> float:
+    """计算幂运算
+
+    Args:
+        base: 底数
+        exponent: 指数
+
+    Returns:
+        幂运算结果
+    """
+    return math.pow(base, exponent)
+
+@mcp.tool()
+def sqrt(number: float) -> float:
+    """计算平方根
+
+    Args:
+        number: 要计算平方根的数
+
+    Returns:
+        平方根结果
+
+    Raises:
+        ValueError: 负数时
+    """
+    if number < 0:
+        raise ValueError("不能计算负数的平方根")
+    return math.sqrt(number)
+
+@mcp.tool()
+def calculate_expression(expression: str) -> dict:
+    """计算数学表达式
+
+    Args:
+        expression: 数学表达式字符串
+
+    Returns:
+        包含结果和详细信息的字典
+    """
+    try:
+        # 安全地计算表达式
+        allowed_names = {k: v for k, v in math.__dict__.items() if not k.startswith("_")}
+        allowed_names.update({
+            'abs': abs,
+            'round': round,
+            'min': min,
+            'max': max,
+            'sum': sum,
+        })
+
+        # 使用eval但要限制环境
+        result = eval(expression, {"__builtins__": {}}, allowed_names)
+
+        return {
+            "expression": expression,
+            "result": result,
+            "type": type(result).__name__,
+            "success": True
+        }
+
+    except Exception as e:
+        return {
+            "expression": expression,
+            "error": str(e),
+            "success": False
+        }
+
+if __name__ == "__main__":
+    mcp.run(transport="stdio")
+'''
+
+    with open("math_mcp_server.py", "w", encoding="utf-8") as f:
+        f.write(server_content)
+    print("✓ 已创建数学MCP服务器文件: math_mcp_server.py")
+
+
+# ============= 7. 创建MCP回调函数 =============
+async def on_progress(
+        progress: float,
+        total: float | None,
+        message: str | None,
+        context: CallbackContext,
+):
+    """处理进度更新"""
+    if total:
+        percent = (progress / total) * 100
+        print(f"[进度 {context.server_name}] {percent:.1f}% - {message}")
+    else:
+        print(f"[进度 {context.server_name}] {progress} - {message}")
+
+
+async def on_logging_message(params, context: CallbackContext):
+    """处理日志消息"""
+    print(f"[日志 {context.server_name}] {params.level}: {params.data}")
+
+
+# ============= 8. 创建MCP工具拦截器 =============
+async def sql_safety_interceptor(request: MCPToolCallRequest, handler):
+    """SQL安全拦截器 - 确保所有SQL查询都是安全的"""
+    if request.name == "execute_sql":
+        # 检查SQL查询
+        query = request.args.get("query", "")
+
+        # 安全检查
+        if "DROP" in query.upper():
+            return ToolMessage(
+                content="错误：检测到DROP语句，拒绝执行。",
+                tool_call_id=request.tool_call_id,
+            )
+
+        # 限制查询大小
+        if len(query) > 1000:
+            return ToolMessage(
+                content="错误：查询语句过长，请简化查询。",
+                tool_call_id=request.tool_call_id,
+            )
+
+    # 继续执行原始请求
+    return await handler(request)
+
+
+async def logging_interceptor(request: MCPToolCallRequest, handler):
+    """日志拦截器 - 记录所有工具调用"""
+    print(f"[工具调用] {request.server_name}.{request.name}: {request.args}")
+
+    # 记录开始时间
+    import time
+    start_time = time.time()
+
+    try:
+        result = await handler(request)
+        elapsed = time.time() - start_time
+
+        print(f"[工具完成] {request.server_name}.{request.name}: {elapsed:.2f}秒")
+        return result
+    except Exception as e:
+        elapsed = time.time() - start_time
+        print(f"[工具错误] {request.server_name}.{request.name}: {e} ({elapsed:.2f}秒)")
+        raise
+
+
+# ============= 9. 初始化MCP客户端 =============
+async def initialize_mcp_client():
+    """初始化MCP客户端"""
+    print("\n" + "=" * 50)
+    print("初始化MCP客户端...")
+
+    # 创建MCP服务器文件
+    create_sql_mcp_server()
+    create_math_mcp_server()
+
+    # 创建回调实例
+    callbacks = Callbacks(
+        on_progress=on_progress,
+        on_logging_message=on_logging_message,
+    )
+
+    # 创建MCP客户端
+    client = MultiServerMCPClient(
+        MCP_SERVERS,
+        tool_interceptors=[sql_safety_interceptor, logging_interceptor],
+        callbacks=callbacks,
+    )
+
+    # 获取所有工具
+    tools = await client.get_tools()
+    print(f"✓ 已加载 {len(tools)} 个MCP工具")
+
+    # 显示可用的工具
+    print("\n可用的MCP工具:")
+    for tool in tools:
+        print(f"  - {tool.name}: {tool.description[:80]}...")
+
+    return client, tools
+
+
+# ============= 10. 创建集成MCP的代理 =============
+async def create_mcp_agent():
+    """创建集成MCP的代理"""
+    # 初始化MCP客户端并获取工具
+    client, mcp_tools = await initialize_mcp_client()
+
+    # 系统提示词（更新为包含MCP工具信息）
+    SYSTEM_PROMPT = f"""你是一个专业的SQL分析助手，可以访问SQLite数据库和数学计算功能。
+
+数据库结构信息:
+{SCHEMA}
+
+可用工具:
+1. SQL工具 (来自sql_server):
+   - execute_sql: 执行SQL查询（必须是SELECT语句）
+   - get_table_info: 获取数据库表结构信息
+   - get_table_schema: 获取指定表的详细结构
+   - count_records: 统计表中记录数量
+
+2. 数学工具 (来自math_server):
+   - add/subtract/multiply/divide: 基本数学运算
+   - power/sqrt: 幂运算和平方根
+   - calculate_expression: 计算数学表达式
+
+重要规则:
+1. 仔细分析用户问题，确定是否需要查询数据或进行计算
+2. 只能使用提供的工具执行SQL查询
+3. 所有SQL查询必须是SELECT语句
+4. 默认限制返回5行，除非用户明确要求更多
+5. 如果工具返回错误，分析原因并调整查询
+6. 提供清晰的中文解释
+7. 优先使用execute_sql工具获取数据
+8. 如果用户询问表结构，可以使用get_table_info或get_table_schema工具
+9. 对于数学计算，使用相应的数学工具
+"""
+
+    # 创建代理
+    agent = create_agent(
+        model=llm,
+        tools=mcp_tools,
+        system_prompt=SYSTEM_PROMPT,
+    )
+
+    return agent, client
+
+
+# ============= 11. 异步对话函数 =============
+async def async_chat_with_agent(agent, question: str):
+    """异步与代理对话的函数"""
+    print(f"\n{'=' * 50}")
+    print(f"用户: {question}")
+    print('-' * 50)
+
+    try:
+        # 异步调用代理
+        response = await agent.ainvoke({"messages": [{"role": "user", "content": question}]})
+
+        # 提取代理的回复
+        if isinstance(response, dict) and "messages" in response:
+            messages = response["messages"]
+        elif hasattr(response, "messages"):
+            messages = response.messages
+        else:
+            messages = None
+
+        if messages:
+            # 从消息列表中获取最后一个助手消息
+            for msg in reversed(messages):
+                if isinstance(msg, dict):
+                    role = msg.get("role")
+                    content = msg.get("content")
+                else:
+                    role = getattr(msg, "role", None)
+                    content = getattr(msg, "content", None)
+
+                if role == "assistant":
+                    print(f"代理: {content or ''}")
+                    return content or ''
+
+        # 兼容其他返回形式
+        if isinstance(response, dict) and "output" in response:
+            print(f"代理: {response['output']}")
+            return response['output']
+        if hasattr(response, "output"):
+            out = getattr(response, "output")
+            print(f"代理: {out}")
+            return out
+
+        print(f"代理回复: {response}")
+        return str(response)
+
+    except Exception as e:
+        print(f"执行出错: {e}")
+        import traceback
+        traceback.print_exc()
+        return f"错误: {e}"
+
+
+# ============= 12. 批处理演示函数（异步） =============
+async def async_batch_process_demo(agent):
+    """异步批处理演示"""
+    questions = [
+        "数据库中有多少个表？",
+        "列出前3个艺术家的名字",
+        "计算 (3 + 5) × 12 的结果",
+        "找出所有来自加拿大的客户",
+        "计算 25 的平方根是多少？",
+        "哪个流派的平均曲目长度最长？",
+        "计算表达式: sin(π/2) + cos(0)"
+    ]
+
+    print("\n" + "=" * 50)
+    print("批处理演示 - 同时处理多个问题")
+    print("=" * 50)
+
+    for i, question in enumerate(questions, 1):
+        print(f"\n[{i}/{len(questions)}] 问题: {question}")
+        await async_chat_with_agent(agent, question)
+
+
+# ============= 13. 交互模式（异步） =============
+async def async_interactive_mode(agent):
+    """异步交互模式"""
+    print("\n" + "=" * 50)
+    print("SQL代理交互模式 (集成MCP)")
+    print("输入以下命令:")
+    print("  '批处理' - 运行批处理演示")
+    print("  '表信息' - 查看数据库表结构")
+    print("  '测试' - 运行测试问题")
+    print("  '数学' - 使用数学工具")
+    print("  '退出' - 结束程序")
+    print("=" * 50)
+
+    while True:
+        try:
+            user_input = input("\n您: ").strip()
+
+            if user_input.lower() in ['退出', 'exit', 'quit']:
+                print("感谢使用，再见！")
+                break
+            elif user_input == '批处理':
+                await async_batch_process_demo(agent)
+                continue
+            elif user_input == '表信息':
+                await async_chat_with_agent(agent, "数据库中有哪些表？请列出所有表名和结构。")
+                continue
+            elif user_input == '测试':
+                await async_test_questions(agent)
+                continue
+            elif user_input == '数学':
+                await math_demo(agent)
+                continue
+
+            if not user_input:
+                continue
+
+            # 处理用户问题
+            await async_chat_with_agent(agent, user_input)
+
+        except KeyboardInterrupt:
+            print("\n\n程序被中断，退出...")
+            break
+        except Exception as e:
+            print(f"发生错误: {e}")
+
+
+# ============= 14. 测试函数（异步） =============
+async def async_test_questions(agent):
+    """运行测试问题"""
+    test_questions = [
+        "数据库中有多少个表？",
+        "列出前5个艺术家的名字",
+        "显示专辑表的前3行",
+        "找出所有来自加拿大的客户",
+        "计算 15 × 8 ÷ 4 的结果",
+        "哪个流派的平均曲目长度最长？"
+    ]
+
+    print("\n" + "=" * 50)
+    print("运行测试问题")
+    print("=" * 50)
+
+    for question in test_questions:
+        await async_chat_with_agent(agent, question)
+
+
+# ============= 15. 数学演示函数 =============
+async def math_demo(agent):
+    """数学工具演示"""
+    math_questions = [
+        "计算 125 + 237",
+        "计算 500 ÷ 25",
+        "计算 3 的 4 次方",
+        "计算 144 的平方根",
+        "计算表达式: (15 × 3) - (8 ÷ 2)",
+        "计算圆的面积，半径为 7（使用公式 πr²）"
+    ]
+
+    print("\n" + "=" * 50)
+    print("数学工具演示")
+    print("=" * 50)
+
+    for question in math_questions:
+        await async_chat_with_agent(agent, question)
+
+
+# ============= 16. 状态管理示例 =============
+async def stateful_session_example():
+    """状态会话示例 - 演示如何使用状态管理"""
+    print("\n" + "=" * 50)
+    print("状态会话示例")
+    print("=" * 50)
+
+    # 创建MCP客户端
+    client = MultiServerMCPClient(MCP_SERVERS)
+
+    # 创建状态会话
+    async with client.session("sql_server") as session:
+        # 在会话中加载工具
+        from langchain_mcp_adapters.tools import load_mcp_tools
+        tools = await load_mcp_tools(session)
+
+        # 创建使用这些工具的代理
+        agent = create_agent(
+            llm,
+            tools,
+            system_prompt="使用SQL工具回答用户问题。"
+        )
+
+        # 使用状态会话进行对话
+        print("使用状态会话进行查询...")
+        response = await agent.ainvoke({
+            "messages": [{"role": "user", "content": "列出前2个艺术家的名字"}]
+        })
+
+        # 提取回复
+        if isinstance(response, dict) and "messages" in response:
+            for msg in response["messages"]:
+                if hasattr(msg, "role") and msg.role == "assistant":
+                    print(f"代理: {msg.content}")
+                    break
+
+
+# ============= 17. 主程序（异步） =============
+async def main():
+    """主程序入口"""
+    print("\n" + "=" * 60)
+    print("SQL代理系统 (集成MCP协议)")
+    print("=" * 60)
+
+    print("\nMCP服务器配置:")
+    for server_name, config in MCP_SERVERS.items():
+        print(f"  {server_name}: {config['transport']} 传输")
+
+    # 创建MCP代理
+    agent, client = await create_mcp_agent()
+
+    # 显示可用功能
+    print("\n可用功能:")
+    print("1. 交互模式 - 输入问题获取SQL查询结果和数学计算")
+    print("2. 批处理演示 - 同时处理多个SQL查询和计算")
+    print("3. 状态会话示例 - 演示MCP状态管理")
+    print("4. 数学工具演示 - 专门测试数学计算功能")
+    print("5. 运行测试问题")
+
+    try:
+        choice = input("\n请选择功能 (1-5) 或直接回车进入交互模式: ").strip()
+
+        if choice == '1' or choice == '':
+            await async_interactive_mode(agent)
+        elif choice == '2':
+            await async_batch_process_demo(agent)
+            await async_interactive_mode(agent)
+        elif choice == '3':
+            await stateful_session_example()
+            await async_interactive_mode(agent)
+        elif choice == '4':
+            await math_demo(agent)
+            await async_interactive_mode(agent)
+        elif choice == '5':
+            await async_test_questions(agent)
+            await async_interactive_mode(agent)
+        else:
+            print("无效选择，进入交互模式...")
+            await async_interactive_mode(agent)
+
+    except Exception as e:
+        print(f"选择出错: {e}")
+        # 默认进入交互模式
+        await async_interactive_mode(agent)
+
+    finally:
+        # 清理MCP客户端
+        if 'client' in locals():
+            await client.close()
+
+
+# ============= 18. 直接调用示例（保持原样但异步化） =============
+async def direct_invoke_example():
+    """直接调用模型的示例"""
+    print("\n" + "=" * 50)
+    print("直接调用模型示例")
+    print("=" * 50)
+
+    # 示例1: 直接调用模型
+    print("\n1. 直接调用模型:")
+    try:
+        response = await llm.ainvoke("请用中文解释什么是SQL注入")
+        print(f"模型回答: {response.content[:100]}...")
+    except Exception as e:
+        print(f"直接调用出错: {e}")
+
+    # 示例2: 使用简单的消息格式
+    print("\n2. 使用消息格式调用:")
+    try:
+        messages = [
+            {"role": "system", "content": "你是一个SQL专家"},
+            {"role": "user", "content": "解释一下什么是SQL JOIN"}
+        ]
+        response = await llm.ainvoke(messages)
+        print(f"模型回答: {response.content[:100]}...")
+    except Exception as e:
+        print(f"消息格式调用出错: {e}")
+
+
+# ============= 19. 运行主程序 =============
+if __name__ == "__main__":
+    # 运行异步主程序
+    asyncio.run(main())
