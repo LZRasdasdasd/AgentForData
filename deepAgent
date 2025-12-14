@@ -1,0 +1,72 @@
+import os
+from typing import Literal
+from tavily import TavilyClient
+
+# 使用阿里云DashScope（通义千问）作为替代
+from langchain_openai import ChatOpenAI
+from deepagents import create_deep_agent
+
+# ========== 1. 配置DashScope ==========
+DASHSCOPE_API_KEY = "sk-fc3984cf3d8a4214a0ea781b417a25b7"  # 示例API密钥，请替换为你的真实密钥
+TAVILY_API_KEY = "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"
+
+# 设置环境变量
+os.environ["TAVILY_API_KEY"] = TAVILY_API_KEY
+
+# ========== 2. 创建搜索工具 ==========
+tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
+
+def internet_search(
+    query: str,
+    max_results: int = 5,
+    topic: Literal["general", "news", "finance"] = "general",
+    include_raw_content: bool = False,
+):
+    """运行网页搜索"""
+    return tavily_client.search(
+        query,
+        max_results=max_results,
+        include_raw_content=include_raw_content,
+        topic=topic,
+    )
+
+# ========== 3. 创建Deep Agent ==========
+research_instructions = """你是一位专家研究员。你的工作是进行深入研究并撰写一份完整的报告。
+
+你拥有互联网搜索工具作为主要的信息收集手段。
+
+## `internet_search`
+使用此工具运行互联网搜索。你可以指定返回结果的最大数量、主题以及是否包含原始内容。
+
+## 工作流程
+1. 首先规划你的研究方法
+2. 使用搜索工具收集相关信息
+3. 管理搜索结果
+4. 综合信息并撰写报告
+"""
+
+# 创建DashScope模型（兼容OpenAI接口）
+model = ChatOpenAI(
+    model="qwen-max",  # 或 qwen-turbo, qwen-plus
+    api_key=DASHSCOPE_API_KEY,
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    temperature=0.1
+)
+
+# 创建Deep Agent
+agent = create_deep_agent(
+    tools=[internet_search],
+    system_prompt=research_instructions,
+    model=model
+)
+
+# ========== 4. 运行Agent ==========
+if __name__ == "__main__":
+    print("🧠 通义千问研究Agent启动...\n")
+
+    result = agent.invoke({
+        "messages": [{"role": "user", "content": "什么是LangGraph？请用它写一个简单的架构概述。"}]
+    })
+
+    print("📄 最终报告:\n")
+    print(result["messages"][-1].content)
