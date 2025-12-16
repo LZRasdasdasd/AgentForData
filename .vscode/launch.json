@@ -1,0 +1,93 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug deepagents CLI",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "deepagents_cli",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/libs/deepagents-cli:${workspaceFolder}/src"
+            },
+            "justMyCode": true,
+            "rules": [
+                {"path": "**/site-packages/deepagents/**", "include": true},
+                {"path": "**/site-packages/langchain/agents/**", "include": true}
+            ]
+        },
+        {
+            "name": "Debug deepagents CLI (with args)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "deepagents_cli",
+            "args": [
+                // 在这里添加你想要的命令行参数
+                // 例如: "--help"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/libs/deepagents-cli:${workspaceFolder}/src"
+            },
+            "justMyCode": true,
+            "rules": [
+                {"path": "**/site-packages/deepagents/**", "include": true},
+                {"path": "**/site-packages/langchain/agents/**", "include": true}
+            ]
+        },
+        {
+            "name": "Debug deepagents CLI (specific agent)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "deepagents_cli",
+            "args": [
+                "--agent",
+                "your-agent-name"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/libs/deepagents-cli:${workspaceFolder}/src"
+            },
+            "justMyCode": true,
+            "rules": [
+                {"path": "**/site-packages/deepagents/**", "include": true},
+                {"path": "**/site-packages/langchain/agents/**", "include": true}
+            ]
+        },
+        {
+            "name": "Debug deepagents CLI (__main__.py)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/libs/deepagents-cli/deepagents_cli/__main__.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/libs/deepagents-cli:${workspaceFolder}/src"
+            },
+            "justMyCode": true,
+            "rules": [
+                {"path": "**/site-packages/deepagents/**", "include": true},
+                {"path": "**/site-packages/langchain/agents/**", "include": true}
+            ]
+        },
+        {
+            "name": "Debug Current Python File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/libs/deepagents-cli:${workspaceFolder}/src"
+            },
+            "justMyCode": true,
+            "rules": [
+                {"path": "**/site-packages/deepagents/**", "include": true},
+                {"path": "**/site-packages/langchain/agents/**", "include": true}
+            ]
+        }
+    ]
+}
